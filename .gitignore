@@ -1,0 +1,24 @@
+# --- Reference downloads: NOT tracked (re-fetched by the .qmd from MaizeGDB URLs) ---
+# W22 genome FASTA (604 MB bgzip), decompressed copy (2 GB), gene GFF3, indexes.
+data/*
+!data/.gitkeep
+# any stray e-PCR genome index
+*.famap
+*.hash
+
+# --- work/ intermediates: keep ONLY the small extracted W22 target sequences ---
+work/*
+!work/locus.fa
+!work/gene.gff3
+
+# --- Quarto / knitr / R render artifacts ---
+/.quarto/
+*_files/
+*_cache/
+*.knit.md
+.Rproj.user/
+.Rhistory
+.RData
+
+# --- misc ---
+.DS_Store

@@ -1,0 +1,289 @@
+---
+title: "GSP genotyping primers for UniformMu *mu1046085* in *Zm00004b034131* (W22)"
+subtitle: "Reproducible pipeline — R + system() calls; gggenomes annotation map"
+author: "thegemmalab@ncsu.edu"
+date: "2026-06-18"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: true
+    embed-resources: true
+    fig-width: 12
+    fig-height: 7.5
+execute:
+  warning: false
+  message: false
+  echo: true
+---
+
+```{r setup}
+suppressPackageStartupMessages({
+  library(gggenomes); library(ggplot2); library(readr)
+  library(dplyr); library(stringr); library(Biostrings)
+})
+
+ROOT      <- "/Users/fvrodriguez/Desktop/primermu"
+DATA      <- file.path(ROOT, "data"); WORK <- file.path(ROOT, "work"); RES <- file.path(ROOT, "results")
+for (d in c(DATA, WORK, RES)) dir.create(d, showWarnings = FALSE, recursive = TRUE)
+
+BASE   <- "https://download.maizegdb.org/Zm-W22-REFERENCE-NRGENE-2.0"
+GENOME <- file.path(DATA, "Zm-W22-REFERENCE-NRGENE-2.0.fa.gz")
+GFFGZ  <- file.path(DATA, "Zm-W22-REFERENCE-NRGENE-2.0_Zm00004b.1.gff3.gz")
+GENE   <- "Zm00004b034131"
+
+# Insertion (UniformMu mu1046085, stock UFMu-05701); 9-bp TSD; W22 NRGENE 2.0
+TSD_SEQ <- "GTTGCGCTG"
+TIR6    <- "AGAGAAGCCAACGCCAWCGCCTCYATTTCGTC"   # Mu-TIR primer (Tm 71.7); TIR8 = fallback
+PAD     <- 2000L                                  # gene +/- 2 kb window
+
+sh <- function(cmd) system2("bash", c("-c", shQuote(cmd)), stdout = TRUE, stderr = TRUE)
+```
+
+## 1. Tools
+
+```{r tools}
+tools <- c("curl","samtools","primer3_core","e-PCR")
+data.frame(tool = tools,
+           path = vapply(tools, function(t) { p <- Sys.which(t); if (p=="") "MISSING" else p }, ""))
+```
+
+## 2. W22 reference (download guarded — skipped if present)
+
+```{r reference}
+if (!file.exists(GENOME)) sh(sprintf("curl -sL --retry 3 -o %s %s/%s", GENOME, BASE, basename(GENOME)))
+if (!file.exists(paste0(GENOME, ".fai"))) sh(sprintf("samtools faidx %s", GENOME))   # builds .fai + .gzi
+if (!file.exists(GFFGZ)) sh(sprintf("curl -sL -o %s %s/%s", GFFGZ, BASE, basename(GFFGZ)))
+file.exists(c(GENOME, paste0(GENOME, ".fai"), GFFGZ))
+```
+
+## 3. Gene model
+
+```{r genemodel}
+genegff <- file.path(WORK, "gene.gff3")
+if (!file.exists(genegff)) sh(sprintf("gzip -dc %s | grep %s > %s", GFFGZ, GENE, genegff))
+gff <- read_tsv(genegff, col_names = c("seqid","src","type","start","end","score","strand","phase","attr"),
+                show_col_types = FALSE)
+gene_row <- gff %>% filter(type == "gene")
+CHR <- gene_row$seqid; STRAND <- gene_row$strand
+GENE_START <- gene_row$start; GENE_END <- gene_row$end
+exons <- gff %>% filter(type == "exon", str_detect(attr, "_T001")) %>% arrange(desc(start))
+EXON1_END <- max(exons$end)   # = gene 5' end (minus strand)
+cat(sprintf("%s  %s:%d-%d  strand %s  | %d exons\n", GENE, CHR, GENE_START, GENE_END, STRAND, nrow(exons)))
+knitr::kable(exons %>% transmute(feature=type, start, end), caption = "Exons (T001)")
+```
+
+## 4. Extract locus (gene ± 2 kb) and locate the 9-bp TSD
+
+```{r locus}
+WIN_START <- GENE_START - PAD; WIN_END <- GENE_END + PAD
+locus_fa  <- file.path(WORK, "locus.fa")
+if (!file.exists(locus_fa))
+  sh(sprintf("samtools faidx %s %s:%d-%d > %s", GENOME, CHR, WIN_START, WIN_END, locus_fa))
+locus <- as.character(readDNAStringSet(locus_fa)[[1]])
+
+hits <- matchPattern(TSD_SEQ, DNAString(locus))
+stopifnot(length(hits) == 1)                     # unique site in the window
+TSD_LOCAL <- start(hits)[1]                       # 1-based local
+TSD_G     <- WIN_START + TSD_LOCAL - 1            # genomic 1-based start of TSD
+TSD_LEN   <- nchar(TSD_SEQ)
+cat(sprintf("TSD %s unique at %s:%d-%d (W22)\n", TSD_SEQ, CHR, TSD_G, TSD_G + TSD_LEN - 1))
+loc <- function(g) g - WIN_START + 1L             # genomic -> window-local 1-based
+```
+
+## 5. Primer3 design — 3 forward + 3 reverse GSPs
+
+One single-sided Primer3 run per flank (forward = exon-side, reverse = below the insertion),
+each GSP kept ≥ 80 bp off the TSD so junction bands are gel-resolvable; all F×R WT products < 500 bp.
+
+```{r primer3}
+off <- TSD_G - WIN_START                          # 0-based index of TSD start
+MIN_OFF <- 80L
+COMMON <- c("PRIMER_TASK=generic","PRIMER_PICK_INTERNAL_OLIGO=0","PRIMER_FIRST_BASE_INDEX=0",
+  "PRIMER_MIN_SIZE=21","PRIMER_OPT_SIZE=24","PRIMER_MAX_SIZE=27",
+  "PRIMER_MIN_TM=60.0","PRIMER_OPT_TM=62.0","PRIMER_MAX_TM=65.0",
+  "PRIMER_MIN_GC=40.0","PRIMER_OPT_GC_PERCENT=50.0","PRIMER_MAX_GC=60.0",
+  "PRIMER_GC_CLAMP=1","PRIMER_MAX_POLY_X=4","PRIMER_MAX_NS_ACCEPTED=0",
+  "PRIMER_THERMODYNAMIC_OLIGO_ALIGNMENT=0","PRIMER_THERMODYNAMIC_TEMPLATE_ALIGNMENT=0",
+  "PRIMER_EXPLAIN_FLAG=1","PRIMER_NUM_RETURN=40")
+
+parse_p3 <- function(path) {
+  L <- readLines(path); L <- L[grepl("=", L, fixed = TRUE) & L != "="]
+  kv <- strsplit(L, "=", fixed = TRUE)
+  setNames(vapply(kv, function(x) paste(x[-1], collapse = "="), ""), vapply(kv, `[`, "", 1))
+}
+
+run_pool <- function(side) {
+  if (side == "F") {                              # gene-forward = RIGHT primer, in exon1 above insertion
+    incl_start <- (off + TSD_LEN - 1) + MIN_OFF
+    incl_len   <- (EXON1_END - WIN_START) - incl_start + 1
+    pick <- c("PRIMER_PICK_LEFT_PRIMER=0","PRIMER_PICK_RIGHT_PRIMER=1"); tag <- "RIGHT"
+  } else {                                        # gene-reverse = LEFT primer, below insertion
+    incl_start <- off - 245
+    incl_len   <- (off - MIN_OFF) - incl_start
+    pick <- c("PRIMER_PICK_LEFT_PRIMER=1","PRIMER_PICK_RIGHT_PRIMER=0"); tag <- "LEFT"
+  }
+  inp <- file.path(WORK, sprintf("p3_%s.txt", side)); outp <- file.path(WORK, sprintf("p3_%s_out.txt", side))
+  writeLines(c(sprintf("SEQUENCE_ID=mu1046085_%s", side), sprintf("SEQUENCE_TEMPLATE=%s", locus),
+               sprintf("SEQUENCE_INCLUDED_REGION=%d,%d", incl_start, incl_len), pick, COMMON, "="), inp)
+  sh(sprintf("primer3_core %s > %s", inp, outp))
+  d <- parse_p3(outp); n <- as.integer(d[[sprintf("PRIMER_%s_NUM_RETURNED", tag)]])
+  if (is.na(n) || n == 0) return(data.frame())
+  do.call(rbind, lapply(0:(n-1), function(i) {
+    pos <- as.integer(strsplit(d[[sprintf("PRIMER_%s_%d", tag, i)]], ",")[[1]])
+    data.frame(name = NA, side = side, rank = i,
+      seq = d[[sprintf("PRIMER_%s_%d_SEQUENCE", tag, i)]],
+      len = pos[2], tm = as.numeric(d[[sprintf("PRIMER_%s_%d_TM", tag, i)]]),
+      gc  = as.numeric(d[[sprintf("PRIMER_%s_%d_GC_PERCENT", tag, i)]]),
+      g5  = WIN_START + pos[1], stringsAsFactors = FALSE)
+  }))
+}
+
+select_spaced <- function(cand, n = 3, min_gap = 22) {
+  cand <- cand[order(cand$rank), ]; keep <- integer(0)
+  for (i in seq_len(nrow(cand)))
+    if (all(abs(cand$g5[i] - cand$g5[keep]) >= min_gap)) { keep <- c(keep, i); if (length(keep) == n) break }
+  cand[keep, ]
+}
+
+region_of <- function(g) ifelse(g >= EXON1_END - (EXON1_END - max(exons$start[exons$start>=GENE_START & exons$end<=EXON1_END])) , "exon1",
+                          ifelse(g > GENE_END, "promoter", ifelse(g < GENE_START, "3'flank", "intron/exon")))
+in_exon <- function(g) any(g >= exons$start & g <= exons$end)
+
+F <- select_spaced(run_pool("F")); F <- F[order(-F$g5), ]; F$name <- paste0("GSP-F", 1:3)
+R <- select_spaced(run_pool("R")); R <- R[order( R$g5), ]; R$name <- paste0("GSP-R", 1:3)
+gsp <- rbind(F, R)
+gsp$region   <- ifelse(vapply(gsp$g5, in_exon, TRUE), "exon", "intron")
+gsp$dist_ins <- ifelse(gsp$side == "F", gsp$g5 - (TSD_G + TSD_LEN - 1), TSD_G - gsp$g5)
+gsp$TIR6_jct <- gsp$dist_ins + TSD_LEN + nchar(TIR6)
+write_tsv(gsp[, c("name","side","seq","len","tm","gc","g5","region","dist_ins","TIR6_jct")],
+          file.path(RES, "gsp_table.tsv"))
+knitr::kable(gsp %>% transmute(name, sequence=seq, len, Tm=round(tm,1), `GC%`=round(gc),
+             `5'_chr9`=g5, region, dist_to_insertion=dist_ins),
+             caption = sprintf("GSPs (Tm spread %.2f C). Fixed partner: TIR6 (Tm 71.7), TIR8 fallback.",
+                               max(gsp$tm)-min(gsp$tm)))
+```
+
+## 6. Amplicon table
+
+```{r amplicons}
+pos <- function(nm) gsp$g5[gsp$name == nm]
+wt_pairs <- list(c("GSP-F3","GSP-R2"), c("GSP-F2","GSP-R1"), c("GSP-F1","GSP-R3"))
+wt <- do.call(rbind, lapply(wt_pairs, function(p) data.frame(
+  primer_pair = paste(p[1], "+", p[2]), amplicon = "WT control", template = "no-insertion allele",
+  size_bp = as.character(abs(pos(p[1]) - pos(p[2])) + 1), precision = "exact")))
+jct <- rbind(
+  do.call(rbind, lapply(F$name, function(n) data.frame(primer_pair = paste(n, "+ TIR6"),
+    amplicon = "5' junction", template = "Mu allele",
+    size_bp = paste0("~", gsp$TIR6_jct[gsp$name==n]), precision = "approx"))),
+  do.call(rbind, lapply(R$name, function(n) data.frame(primer_pair = paste(n, "+ TIR6"),
+    amplicon = "3' junction", template = "Mu allele",
+    size_bp = paste0("~", gsp$TIR6_jct[gsp$name==n]), precision = "approx"))))
+amp_tab <- rbind(wt, jct); write_tsv(amp_tab, file.path(RES, "amplicons.tsv"))
+knitr::kable(amp_tab, caption = "Diagnostic amplicons (WT sizes exact; junctions +constant intra-TIR offset).")
+```
+
+## 7. Specificity — forward e-PCR over the whole W22 genome
+
+```{r epcr}
+W22FA <- file.path(DATA, "W22.fa")
+if (!file.exists(W22FA)) sh(sprintf("bgzip -dc %s > %s", GENOME, W22FA))
+sts <- file.path(WORK, "epcr_sts.txt")
+combos <- expand.grid(Fi = 1:3, Rj = 1:3)
+writeLines(apply(combos, 1, function(x) sprintf("F%dxR%d\t%s\t%s\t100-600",
+  x["Fi"], x["Rj"], F$seq[x["Fi"]], R$seq[x["Rj"]])), sts)
+epcr_out <- file.path(RES, "epcr_fwd.txt")
+sh(sprintf("e-PCR -n 1 -g 1 -m 200 -w 7 -t 3 -o %s %s %s", epcr_out, sts, W22FA))
+ep <- read_tsv(epcr_out, comment = "#", col_names =
+  c("seq","sts","strand","from","to","size","mism","gaps","x"), show_col_types = FALSE)
+cat(sprintf("e-PCR: %d combos, %d total amplicons, %d distinct loci (all on %s) -> %s\n",
+    nrow(combos), nrow(ep), length(unique(paste(ep$seq, ep$from))), unique(ep$seq),
+    ifelse(all(table(ep$sts) == 1), "every pair single-product = SPECIFIC", "CHECK")))
+knitr::kable(ep %>% transmute(pair=sts, chr=seq, from, to, size_bp=str_replace(size,"/.*","")),
+             caption = "Forward e-PCR hits (1 mismatch, 1 gap).")
+```
+
+## 8. Annotation map (gggenomes — LH244_CRISPR style)
+
+```{r plot, fig.width=12, fig.height=7.5}
+seqs <- data.frame(seq_id = "locus", length = nchar(locus))
+exon_df <- exons %>% transmute(seq_id = "locus", start = loc(start), end = loc(end), feat_type = "Exon")
+ins_df  <- data.frame(seq_id = "locus", start = loc(TSD_G), end = loc(TSD_G+TSD_LEN-1),
+                      feat_type = "Insertion", name = "mu1046085")
+prim <- do.call(rbind, lapply(seq_len(nrow(gsp)), function(i) { r <- gsp[i, ]
+  if (r$side == "F") { s5 <- r$g5; s3 <- r$g5 - (r$len-1); ft <- "forward_primer" }
+  else               { s5 <- r$g5; s3 <- r$g5 + (r$len-1); ft <- "reverse_primer" }
+  data.frame(seq_id="locus", start=loc(s5), end=loc(s3), feat_type=ft, name=r$name) }))
+mkamp <- function(nm, a, b, ft) data.frame(seq_id="locus", start=loc(min(a,b)), end=loc(max(a,b)),
+                                           feat_type=ft, name=nm)
+amp <- do.call(rbind, c(
+  lapply(wt_pairs, function(p) mkamp(sprintf("WT %s+%s %d", sub("GSP-","",p[1]), sub("GSP-","",p[2]),
+         abs(pos(p[1])-pos(p[2]))+1), pos(p[1]), pos(p[2]), "WT_amplicon")),
+  lapply(F$name, function(n) mkamp(sprintf("%s+TIR6 ~%d", sub("GSP-","",n), gsp$TIR6_jct[gsp$name==n]),
+         pos(n), TSD_G, "junction_5")),
+  lapply(R$name, function(n) mkamp(sprintf("%s+TIR6 ~%d", sub("GSP-","",n), gsp$TIR6_jct[gsp$name==n]),
+         pos(n), TSD_G+TSD_LEN-1, "junction_3"))))
+amp$yoff <- 0.18 + 0.12 * (seq_len(nrow(amp)) - 1)
+
+p <- gggenomes(seqs = seqs, genes = prim,
+               feats = list(amplicons = amp, exons = exon_df, insertion = ins_df)) +
+  geom_seq() +
+  geom_feat(data = feats(exons), aes(y = y-0.15, yend = y-0.15, color = feat_type),
+            position="identity", linewidth = 5, alpha = 0.85) +
+  geom_feat(data = feats(insertion), aes(color = feat_type), linewidth = 7) +
+  geom_feat_label(data = feats(insertion), aes(label = name), size = 2.6, nudge_y = -0.12, color = "#D94040") +
+  geom_feat(data = feats(amplicons), aes(y = y+yoff, yend = y+yoff, color = feat_type),
+            position="identity", linewidth = 2.6, alpha = 0.75) +
+  geom_text(data = amp, aes(x = pmin(start,end), y = 1+yoff+0.045, label = name),
+            hjust = 0, vjust = 0, size = 2.2, color = "grey20", inherit.aes = FALSE) +
+  geom_gene(aes(fill = feat_type), color = NA, size = 11) +
+  geom_gene_label(aes(label = name), size = 2.3, nudge_y = 0.05) +
+  geom_vline(xintercept = c(loc(GENE_START), loc(GENE_END)), linetype = "dashed",
+             color = "grey40", linewidth = 0.4) +
+  geom_vline(xintercept = loc(TSD_G), linetype = "dotted", color = "#D94040", linewidth = 0.3) +
+  scale_color_manual(name = NULL,
+    values = c("Exon"="#DAA520","Insertion"="#D94040","WT_amplicon"="lightskyblue",
+               "junction_5"="#40A040","junction_3"="#9060C0"),
+    labels = c("Exon"="Exon","Insertion"="Mu insertion (9-bp TSD)","WT_amplicon"="WT control (F+R)",
+               "junction_5"="5' junction (F+TIR6)","junction_3"="3' junction (R+TIR6)")) +
+  scale_fill_manual(name = NULL, values = c("forward_primer"="#40A040","reverse_primer"="#9060C0"),
+    labels = c("forward_primer"="Forward GSP","reverse_primer"="Reverse GSP")) +
+  scale_x_continuous(labels = function(x) format(round(x + WIN_START - 1), big.mark = ",")) +
+  coord_cartesian(xlim = c(loc(TSD_G-300), loc(TSD_G+260)), ylim = c(0.55, 2.45)) +
+  labs(title = sprintf("%s — UniformMu mu1046085: primers & amplicons", GENE),
+       subtitle = "chr9 minus strand (zoom). Junction bars = genomic footprint to the TSD; product continues into Mu via TIR6.",
+       x = "chr9 position (bp)") +
+  theme(legend.position = "bottom", axis.text.y = element_blank(), axis.ticks.y = element_blank(),
+        axis.title.y = element_blank(), panel.grid.minor = element_blank())
+ggsave(file.path(RES, "annotation_map.png"), p, width = 12, height = 7.5, dpi = 150)
+p
+```
+
+## 9. Assay & interpretation
+
+Multiplex per plant: **GSP-F + GSP-R + TIR6**.
+
+- **WT band only** (377 / 410 / 446 bp) → homozygous wild-type
+- **Junction band(s) only** (GSP + TIR6, ~199–282 bp) → homozygous insertion
+- **Both** → heterozygous
+
+Workflow (McCarty/UniformMu): confirm each GSP-F+GSP-R pair on **W22 control DNA**; then run **both**
+GSP-F+TIR6 and GSP-R+TIR6 on UFMu plant DNA (occasionally only one side amplifies); **sequence**
+junction products (TSD `GTTGCGCTG` abutting the TIR). e-PCR shows the locus is single-copy → no
+false-heterozygous-from-duplication risk.
+
+**Touchdown PCR:** 94 °C 1′; [94 °C 25″ / 62 °C 30″ / 72 °C 1′] ×8–10; [94 °C 25″ / 56 °C 30″ /
+72 °C 1′] ×~27; 72 °C 5′; 4 °C. Add **5 % DMSO** (fresh) or PCRx Enhancer for GC-rich maize template.
+TIR6's high Tm (71.7) vs ~62 °C GSPs is handled by the touchdown.
+
+## References
+
+- **UniformMu PCR confirmation protocol** (TIR6/TIR8 primers, touchdown PCR, genotyping workflow): *UniformMu Resource (2011)*, McCarty lab. <https://download.maizegdb.org/Insertions/UniformMu/UniformMu_Resource_2011.pdf>
+- Settles AM *et al.* (2004) Sequence-indexed mutations in maize using the UniformMu transposon-tagging population. *BMC Genomics* 5:84.
+- W22 reference genome: **Zm-W22-REFERENCE-NRGENE-2.0**, MaizeGDB. <https://download.maizegdb.org/Zm-W22-REFERENCE-NRGENE-2.0/>
+- Tools: Primer3, NCBI e-PCR/re-PCR, samtools, gggenomes (Hackl *et al.*).
+
+```{r sessioninfo}
+#| code-fold: true
+sessionInfo()
+```

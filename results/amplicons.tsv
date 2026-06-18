@@ -1,0 +1,10 @@
+primer_pair	amplicon	template	size_bp	precision
+GSP-F3 + GSP-R2	WT control	no-insertion allele	377	exact
+GSP-F2 + GSP-R1	WT control	no-insertion allele	446	exact
+GSP-F1 + GSP-R3	WT control	no-insertion allele	410	exact
+GSP-F1 + TIR6	5' junction	Mu allele	~260	approx
+GSP-F2 + TIR6	5' junction	Mu allele	~237	approx
+GSP-F3 + TIR6	5' junction	Mu allele	~199	approx
+GSP-R1 + TIR6	3' junction	Mu allele	~282	approx
+GSP-R2 + TIR6	3' junction	Mu allele	~251	approx
+GSP-R3 + TIR6	3' junction	Mu allele	~223	approx
