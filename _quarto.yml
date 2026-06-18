@@ -1,0 +1,5 @@
+project:
+  type: default
+  output-dir: docs
+  render:
+    - mu1046085_primer_design.qmd

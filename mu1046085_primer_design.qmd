@@ -5,6 +5,7 @@ author: "thegemmalab@ncsu.edu"
 date: "2026-06-18"
 format:
   html:
+    output-file: index.html
     toc: true
     toc-depth: 3
     code-fold: true

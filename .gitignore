@@ -22,3 +22,8 @@ work/*
 
 # --- misc ---
 .DS_Store
+
+# generated html (now rendered into docs/)
+/mu1046085_primer_design.html
+
+**/*.quarto_ipynb
