@@ -56,7 +56,7 @@ All 6 in the recommended 60–65 °C window; pool Tm spread = 1.35 °C. Forwards
 
 ## 5. Specificity — forward e-PCR (genome-wide, W22)
 
-`e-PCR -n 1 -g 1 -m 200 -w 7` over the whole W22 genome. **All 9 F×R combos → exactly one amplicon**, all at the chr9 target, 0 mismatches / 0 gaps. No paralogous or duplicate amplicons anywhere → no false-heterozygous risk from gene duplication.
+`e-PCR -n 3 -g 1 -m 200 -w 7 -a f` over the whole W22 genome (relaxed scan: up to 3 mismatches + 1 gap per primer). **All 9 F×R combos → exactly one amplicon**, all at the chr9 target, 0 mismatches / 0 gaps — even under the relaxed tolerance no additional priming site appears anywhere. No paralogous or duplicate amplicons → no false-heterozygous risk from gene duplication. (F1×R1 = 468 bp, the ~500 bp primary band.)
 
 ## 6. Assay & interpretation
 

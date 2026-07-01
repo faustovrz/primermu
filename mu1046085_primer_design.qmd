@@ -24,8 +24,8 @@ suppressPackageStartupMessages({
   library(dplyr); library(stringr); library(Biostrings)
 })
 
-ROOT      <- "/Users/fvrodriguez/Desktop/primermu"
-DATA      <- file.path(ROOT, "data"); WORK <- file.path(ROOT, "work"); RES <- file.path(ROOT, "results")
+# Paths are relative to the project root — Quarto executes chunks from there (portable; no absolute paths).
+DATA      <- "data"; WORK <- "work"; RES <- "results"
 for (d in c(DATA, WORK, RES)) dir.create(d, showWarnings = FALSE, recursive = TRUE)
 
 BASE   <- "https://download.maizegdb.org/Zm-W22-REFERENCE-NRGENE-2.0"
@@ -52,9 +52,9 @@ data.frame(tool = tools,
 ## 2. W22 reference (download guarded — skipped if present)
 
 ```{r reference}
-if (!file.exists(GENOME)) sh(sprintf("curl -sL --retry 3 -o %s %s/%s", GENOME, BASE, basename(GENOME)))
-if (!file.exists(paste0(GENOME, ".fai"))) sh(sprintf("samtools faidx %s", GENOME))   # builds .fai + .gzi
-if (!file.exists(GFFGZ)) sh(sprintf("curl -sL -o %s %s/%s", GFFGZ, BASE, basename(GFFGZ)))
+if (!file.exists(GENOME)) sh(sprintf("curl -sL --retry 3 -o %s %s/%s", shQuote(GENOME), BASE, basename(GENOME)))
+if (!file.exists(paste0(GENOME, ".fai"))) sh(sprintf("samtools faidx %s", shQuote(GENOME)))   # builds .fai + .gzi
+if (!file.exists(GFFGZ)) sh(sprintf("curl -sL -o %s %s/%s", shQuote(GFFGZ), BASE, basename(GFFGZ)))
 file.exists(c(GENOME, paste0(GENOME, ".fai"), GFFGZ))
 ```
 
@@ -62,7 +62,7 @@ file.exists(c(GENOME, paste0(GENOME, ".fai"), GFFGZ))
 
 ```{r genemodel}
 genegff <- file.path(WORK, "gene.gff3")
-if (!file.exists(genegff)) sh(sprintf("gzip -dc %s | grep %s > %s", GFFGZ, GENE, genegff))
+if (!file.exists(genegff)) sh(sprintf("gzip -dc %s | grep %s > %s", shQuote(GFFGZ), GENE, shQuote(genegff)))
 gff <- read_tsv(genegff, col_names = c("seqid","src","type","start","end","score","strand","phase","attr"),
                 show_col_types = FALSE)
 gene_row <- gff %>% filter(type == "gene")
@@ -80,7 +80,7 @@ knitr::kable(exons %>% transmute(feature=type, start, end), caption = "Exons (T0
 WIN_START <- GENE_START - PAD; WIN_END <- GENE_END + PAD
 locus_fa  <- file.path(WORK, "locus.fa")
 if (!file.exists(locus_fa))
-  sh(sprintf("samtools faidx %s %s:%d-%d > %s", GENOME, CHR, WIN_START, WIN_END, locus_fa))
+  sh(sprintf("samtools faidx %s %s:%d-%d > %s", shQuote(GENOME), CHR, WIN_START, WIN_END, shQuote(locus_fa)))
 locus <- as.character(readDNAStringSet(locus_fa)[[1]])
 
 hits <- matchPattern(TSD_SEQ, DNAString(locus))
@@ -127,7 +127,7 @@ run_pool <- function(side) {
   inp <- file.path(WORK, sprintf("p3_%s.txt", side)); outp <- file.path(WORK, sprintf("p3_%s_out.txt", side))
   writeLines(c(sprintf("SEQUENCE_ID=mu1046085_%s", side), sprintf("SEQUENCE_TEMPLATE=%s", locus),
                sprintf("SEQUENCE_INCLUDED_REGION=%d,%d", incl_start, incl_len), pick, COMMON, "="), inp)
-  sh(sprintf("primer3_core %s > %s", inp, outp))
+  sh(sprintf("primer3_core %s > %s", shQuote(inp), shQuote(outp)))
   d <- parse_p3(outp); n <- as.integer(d[[sprintf("PRIMER_%s_NUM_RETURNED", tag)]])
   if (is.na(n) || n == 0) return(data.frame())
   do.call(rbind, lapply(0:(n-1), function(i) {
@@ -188,20 +188,25 @@ knitr::kable(amp_tab, caption = "Diagnostic amplicons (WT sizes exact; junctions
 
 ```{r epcr}
 W22FA <- file.path(DATA, "W22.fa")
-if (!file.exists(W22FA)) sh(sprintf("bgzip -dc %s > %s", GENOME, W22FA))
+if (!file.exists(W22FA)) sh(sprintf("bgzip -dc %s > %s", shQuote(GENOME), shQuote(W22FA)))
 sts <- file.path(WORK, "epcr_sts.txt")
 combos <- expand.grid(Fi = 1:3, Rj = 1:3)
 writeLines(apply(combos, 1, function(x) sprintf("F%dxR%d\t%s\t%s\t100-600",
   x["Fi"], x["Rj"], F$seq[x["Fi"]], R$seq[x["Rj"]])), sts)
 epcr_out <- file.path(RES, "epcr_fwd.txt")
-sh(sprintf("e-PCR -n 1 -g 1 -m 200 -w 7 -t 3 -o %s %s %s", epcr_out, sts, W22FA))
+# Specificity params: allow up to 3 mismatches (-n 3) + 1 gap (-g 1) per primer -> relaxed
+# off-target scan. -a f = precise-alignment fallback, recommended by e-PCR whenever gaps > 0.
+epcr_cmd <- sprintf("e-PCR -n 3 -g 1 -m 200 -w 7 -t 3 -a f -o %s %s %s",
+                    shQuote(epcr_out), shQuote(sts), shQuote(W22FA))
+cat(epcr_cmd, "\n")            # show the exact command line in the rendered report
+sh(epcr_cmd)
 ep <- read_tsv(epcr_out, comment = "#", col_names =
   c("seq","sts","strand","from","to","size","mism","gaps","x"), show_col_types = FALSE)
 cat(sprintf("e-PCR: %d combos, %d total amplicons, %d distinct loci (all on %s) -> %s\n",
     nrow(combos), nrow(ep), length(unique(paste(ep$seq, ep$from))), unique(ep$seq),
     ifelse(all(table(ep$sts) == 1), "every pair single-product = SPECIFIC", "CHECK")))
 knitr::kable(ep %>% transmute(pair=sts, chr=seq, from, to, size_bp=str_replace(size,"/.*","")),
-             caption = "Forward e-PCR hits (1 mismatch, 1 gap).")
+             caption = "Forward e-PCR hits (relaxed scan: up to 3 mismatches, 1 gap).")
 ```
 
 ## 8. Annotation map (gggenomes — LH244_CRISPR style)
