@@ -1,0 +1,577 @@
+---
+title: "*mgd* genotyping primers + CRISPR guide in maize LH244"
+subtitle: "Whole-genome e-PCR specificity → overlap with gene annotation → gggenomes annotation maps"
+author: "thegemmalab@ncsu.edu"
+date: "2026-07-29"
+format:
+  html:
+    output-file: mgd_LH244_primer_check.html
+    toc: true
+    toc-depth: 2
+    code-fold: true
+    embed-resources: true
+    fig-width: 12
+    fig-height: 5
+execute:
+  warning: false
+  message: false
+  echo: true
+---
+
+```{r setup}
+suppressPackageStartupMessages({
+  library(gggenomes); library(ggplot2); library(readr)
+  library(dplyr); library(tidyr); library(stringr); library(Biostrings)
+})
+
+# Relative paths — Quarto executes chunks from the project root (portable).
+DATA <- "data"; WORK <- "work_lh244"; RES <- "results_lh244"
+for (d in c(DATA, WORK, RES)) dir.create(d, showWarnings = FALSE, recursive = TRUE)
+
+BASE   <- "https://download.maizegdb.org/Zm-LH244-REFERENCE-CAU-1.0"
+GENOME <- file.path(DATA, "Zm-LH244-REFERENCE-CAU-1.0.fa.gz")   # bgzip, as distributed
+GENOFA <- file.path(DATA, "LH244.fa")                            # plain FASTA for e-PCR / BLAST
+GFFGZ  <- file.path(DATA, "Zm-LH244-REFERENCE-CAU-1.0_Zm00116aa.1.gff3.gz")
+GFF    <- file.path(WORK, "LH244.gff3")
+
+PRIMER_F <- "GAGACGGTGCTGGAGACC"        # mgd genotyping pair
+PRIMER_R <- "GGTGTCGCTCATGAGGATGA"
+GUIDE    <- "CGCAAGAGCCTCACCTACGC"      # CRISPR/Cas9 sgRNA spacer (20 nt)
+
+sh <- function(cmd) system2("bash", c("-c", shQuote(cmd)), stdout = TRUE, stderr = TRUE)
+
+# Reference + annotation (guarded: existing files are reused, not re-downloaded)
+if (!file.exists(GENOME)) sh(sprintf("curl -sL --retry 3 -o %s %s/%s", shQuote(GENOME), BASE, basename(GENOME)))
+if (!file.exists(GFFGZ))  sh(sprintf("curl -sL --retry 3 -o %s %s/%s", shQuote(GFFGZ),  BASE, basename(GFFGZ)))
+if (!file.exists(GENOFA)) sh(sprintf("bgzip -dc %s > %s", shQuote(GENOME), shQuote(GENOFA)))
+if (!file.exists(paste0(GENOFA, ".fai"))) sh(sprintf("samtools faidx %s", shQuote(GENOFA)))
+if (!file.exists(GFF))    sh(sprintf("gzip -dc %s > %s", shQuote(GFFGZ), shQuote(GFF)))
+
+grab <- function(chr, s, e, rc = FALSE) {
+  o <- system2("samtools", c("faidx", GENOFA, sprintf("%s:%d-%d", chr, s, e)), stdout = TRUE)
+  d <- DNAString(toupper(paste(o[-1], collapse = "")))
+  as.character(if (rc) reverseComplement(d) else d)
+}
+```
+
+## 1. e-PCR specificity over the whole genome
+
+`-n 3 -g 1` = up to 3 mismatches + 1 gap **per primer**. (In e-PCR `-m` is the product-size
+*margin*, not mismatches — `-n` sets mismatches.) Counts in the output are totals across both primers.
+
+```{r epcr}
+sts <- file.path(WORK, "epcr_sts.txt")
+writeLines(sprintf("mgd_F_R\t%s\t%s\t50-2000", PRIMER_F, PRIMER_R), sts)
+
+epcr_out <- file.path(RES, "epcr_mgd.txt")
+epcr_cmd <- sprintf("e-PCR -n 3 -g 1 -m 50 -w 7 -t 3 -a f -o %s %s %s",
+                    shQuote(epcr_out), shQuote(sts), shQuote(GENOFA))
+cat(epcr_cmd, "\n")
+sh(epcr_cmd)                                    # ~13 s over the 2.3 Gb assembly
+
+ep <- read_tsv(epcr_out, comment = "#", show_col_types = FALSE,
+               col_names = c("seq","sts","strand","from","to","size","mism","gaps","x"))
+```
+
+e-PCR reports one combined mismatch count, and its `to` is 1 bp short of the reverse primer's 3′
+end. Both are corrected below by re-extracting each primer site from the genome — needed because a
+mismatch in the last few 3′ bases blocks extension, whereas a 5′ mismatch usually does not.
+
+```{r sites}
+sites <- bind_rows(lapply(seq_len(nrow(ep)), function(i) {
+  r <- ep[i, ]; lf <- nchar(PRIMER_F); lr <- nchar(PRIMER_R); TO <- r$to + 1L
+  if (r$strand == "+") { fs <- c(r$from, r$from+lf-1); rs <- c(TO-lr+1, TO); frc <- FALSE; rrc <- TRUE }
+  else                 { fs <- c(TO-lf+1, TO); rs <- c(r$from, r$from+lr-1); frc <- TRUE;  rrc <- FALSE }
+  mm <- function(site, p) { a <- strsplit(site,"")[[1]]; b <- strsplit(p,"")[[1]]; n <- length(b)
+                            d <- which(a[seq_len(n)] != b); c(length(d), sum(d > n-5)) }
+  fsite <- grab(r$seq, fs[1], fs[2], frc); rsite <- grab(r$seq, rs[1], rs[2], rrc)
+  cf <- mm(fsite, PRIMER_F); cr <- mm(rsite, PRIMER_R)
+  tibble(chr = r$seq, strand = r$strand, from = r$from, to = TO, amp_bp = TO - r$from + 1L,
+         mism = r$mism, gaps = r$gaps, F_mm = cf[1], F_3p = cf[2], R_mm = cr[1], R_3p = cr[2],
+         locus = sprintf("%s:%d-%d", r$seq, r$from, TO),
+         F_start = fs[1], F_end = fs[2], R_start = rs[1], R_end = rs[2])
+})) %>% arrange(mism, amp_bp)
+
+knitr::kable(sites %>% transmute(locus, strand, amp_bp, total_mm = mism, gaps, F_mm, R_mm,
+                                 `mm in 3' 5nt` = F_3p + R_3p),
+             caption = "All 14 e-PCR amplicons. For the 6 ungapped hits F_mm + R_mm reproduces e-PCR's total exactly; for gapped hits these are upper bounds (the ungapped comparison is not e-PCR's alignment).")
+```
+
+**Six products are credible** — 0 gaps, ≤2 total mismatches, and no mismatch in either primer's
+3′-terminal 5 nt, so all six will amplify. The intended target is the only perfect, and the only
+264 bp, product; the other five are ~200 bp. The eight gapped hits (7–25 apparent mismatches) are
+not real products.
+
+```{r credible}
+credible <- sites %>% filter(gaps == 0)
+knitr::kable(credible %>% transmute(locus, strand, amp_bp, total_mm = mism, F_mm, R_mm),
+             caption = "The 6 credible products.")
+```
+
+The five ~200 bp products are **92.5–100 % identical to each other but only 64–67 % identical to
+the 264 bp target** — a dispersed repeat family that happens to carry both primer sites 200 bp
+apart, not *mgd* paralogues.
+
+```{r identity}
+amp_seqs <- DNAStringSet(lapply(seq_len(nrow(credible)), function(i)
+  DNAString(grab(credible$chr[i], credible$from[i], credible$to[i], credible$strand[i] == "-"))))
+names(amp_seqs) <- credible$locus
+n <- length(amp_seqs)
+pidm <- outer(seq_len(n), seq_len(n), Vectorize(function(i, j)
+  round(pwalign::pid(pwalign::pairwiseAlignment(amp_seqs[[i]], amp_seqs[[j]], type = "global")), 1)))
+dimnames(pidm) <- list(sprintf("%s (%d bp)", credible$locus, credible$amp_bp), credible$locus)
+knitr::kable(pidm, caption = "Pairwise % identity of the 6 credible amplicons. Row 1 = intended target.")
+```
+
+### CRISPR guide — BLAST
+
+`megablast` cannot be used here: its default word size is 28, longer than the 20 nt spacer, so it
+returns nothing. `-task blastn-short` (word size 7) is the short-query task.
+
+```{r guide-blast}
+DB <- file.path(WORK, "lh244nt")
+if (!file.exists(paste0(DB, ".nsq")) && !file.exists(paste0(DB, ".00.nsq")))
+  sh(sprintf("makeblastdb -in %s -dbtype nucl -out %s -title LH244", shQuote(GENOFA), shQuote(DB)))
+gfa <- file.path(WORK, "guide.fa"); writeLines(c(">guide", GUIDE), gfa)
+
+cat("megablast hits:", length(sh(sprintf(
+  "blastn -task megablast -query %s -db %s -outfmt 6 -num_threads 6", shQuote(gfa), shQuote(DB)))), "\n")
+
+gb <- read_tsv(I(sh(sprintf(
+  "blastn -task blastn-short -query %s -db %s -evalue 10 -max_target_seqs 5000 -num_threads 6 -outfmt '6 sseqid sstart send sstrand qstart qend length mismatch'",
+  shQuote(gfa), shQuote(DB)))),
+  col_names = c("chr","sstart","send","sstrand","qstart","qend","len","mm"), show_col_types = FALSE)
+knitr::kable(gb, caption = "Raw blastn-short output for the guide.")
+```
+
+::: {.callout-warning}
+BLAST reports *local* alignments, so it truncates at a mismatch: the two chr8 hits are listed as
+"18 bp, 0 mismatches", which reads like a harmless partial match. Re-extracting the full 20 nt +
+PAM shows they are **19/20 matches with a valid NGG PAM** — i.e. real off-target candidates.
+:::
+
+```{r guide-sites}
+# Reconstruct each candidate as full spacer + 3-nt PAM, in guide orientation.
+gsites <- gb %>% filter(len >= 18) %>%
+  transmute(chr, strand = ifelse(sstrand == "plus", "+", "-"),
+            g_start = ifelse(sstrand == "plus", sstart - (qstart - 1), send  - (20 - qend)),
+            g_end   = ifelse(sstrand == "plus", sstart - (qstart - 1) + 19, sstart + (qstart - 1))) %>%
+  rowwise() %>%
+  mutate(start = min(g_start, g_end), end = max(g_start, g_end),
+         seq20 = grab(chr, start, end, strand == "-"),
+         pam   = if (strand == "+") grab(chr, end + 1, end + 3) else grab(chr, start - 3, start - 1, TRUE),
+         mism  = sum(strsplit(seq20, "")[[1]] != strsplit(GUIDE, "")[[1]]),
+         mm_pos = paste(which(strsplit(seq20,"")[[1]] != strsplit(GUIDE,"")[[1]]), collapse = ","),
+         NGG   = grepl("GG$", pam)) %>% ungroup() %>%
+  transmute(site = sprintf("%s:%d-%d (%s)", chr, start, end, strand), chr, start, end, strand,
+            spacer = seq20, PAM = pam, mismatches = mism, `mm position` = mm_pos, `valid NGG` = NGG)
+knitr::kable(gsites, caption = sprintf("Guide %s — genome-wide candidate sites (spacer + PAM).", GUIDE))
+```
+
+The guide is **unique as a perfect match** (`chr5:224,995,338-224,995,357`, PAM `CGG`). The two
+chr8 sites carry a single mismatch at **position 19**, in the PAM-proximal seed where mismatches
+are least tolerated, and both are **intergenic** (§2) — so cleavage there would not disrupt a gene.
+
+## 2. Overlap with the gene annotation
+
+```{r overlap}
+amp_bed <- file.path(WORK, "amp.bed")
+write_tsv(sites %>% transmute(chr, start = from - 1L, end = to, name = locus, score = mism, strand) %>%
+            arrange(chr, start), amp_bed, col_names = FALSE)
+gd_bed <- file.path(WORK, "guide_sites.bed")
+write_tsv(gsites %>% transmute(chr, start = start - 1L, end, name = site, score = mismatches, strand) %>%
+            arrange(chr, start), gd_bed, col_names = FALSE)
+
+mk <- function(type, out, idexpr) {                     # GFF3 -> BED; NF==9 drops '###' lines
+  if (!file.exists(out)) sh(sprintf(
+    "awk -F'\\t' 'NF==9 && $3==\"%s\"{%s; printf \"%%s\\t%%d\\t%%d\\t%%s\\t.\\t%%s\\n\",$1,$4-1,$5,id,$7}' %s | sort -k1,1 -k2,2n > %s",
+    type, idexpr, shQuote(GFF), shQuote(out)))
+  out
+}
+genes_bed <- mk("gene", file.path(WORK, "genes.bed"), 'id=$9; sub(/^ID=/,"",id); sub(/;.*/,"",id)')
+exons_bed <- mk("exon", file.path(WORK, "exons.bed"), 'id=$9; sub(/.*Parent=/,"",id); sub(/;.*/,"",id)')
+
+bt <- function(a, b) read_tsv(I(sh(sprintf("bedtools intersect -a %s -b %s -wao", shQuote(a), shQuote(b)))),
+  col_names = c("chr","astart","aend","name","score","astrand",
+                "bchr","bstart","bend","bid","bscore","bstrand","ovl"), show_col_types = FALSE)
+
+summ <- function(a) {
+  g <- bt(a, genes_bed); e <- bt(a, exons_bed)
+  g %>% group_by(name) %>%
+    summarise(gene = paste(unique(bid[bid != "."]), collapse = ","),
+              gene_strand = paste(unique(bstrand[bstrand != "."]), collapse = ","),
+              gene_bp = sum(ifelse(bid == ".", 0L, ovl)), .groups = "drop") %>%
+    left_join(e %>% group_by(name) %>%
+                summarise(exon_bp = sum(ifelse(bid == ".", 0L, ovl)), .groups = "drop"), by = "name") %>%
+    mutate(gene = ifelse(gene == "", "— intergenic —", gene), intron_bp = gene_bp - exon_bp)
+}
+amp_ov <- sites %>% left_join(summ(amp_bed), by = c("locus" = "name"))
+gd_ov  <- gsites %>% left_join(summ(gd_bed),  by = c("site" = "name"))
+write_tsv(amp_ov, file.path(RES, "amplicon_gene_overlap.tsv"))
+write_tsv(gd_ov,  file.path(RES, "guide_gene_overlap.tsv"))
+
+cat(sprintf("Amplicons overlapping a gene: %d/%d.  Guide sites overlapping a gene: %d/%d.\n",
+            sum(amp_ov$gene_bp > 0), nrow(amp_ov), sum(gd_ov$gene_bp > 0), nrow(gd_ov)))
+```
+
+```{r overlap-tables}
+knitr::kable(amp_ov %>% arrange(desc(gene_bp > 0), mism) %>%
+  transmute(locus, amp_bp, total_mm = mism, gaps, gene, gene_strand, gene_bp, exon_bp, intron_bp,
+            context = case_when(gene_bp == 0 ~ "intergenic", exon_bp == amp_bp ~ "wholly exonic",
+                                exon_bp > 0 ~ "exon + intron", TRUE ~ "wholly intronic")),
+  caption = "Amplicon x gene annotation (bedtools intersect -wao).")
+
+knitr::kable(gd_ov %>% transmute(site, spacer, PAM, mismatches, `valid NGG`, gene, gene_bp, exon_bp),
+             caption = "Guide site x gene annotation.")
+```
+
+Four amplicons and one guide site fall in annotated genes:
+
+- **`Zm00116aa310960`** (chr5, `+`, 4.88 kb, 8 exons) — the **intended target**. The 264 bp
+  amplicon (0 mismatches) and the guide on-target both sit **inside exon 1**. Because both primers
+  are in one exon, genomic and cDNA products are the same size.
+- **`Zm00116aa292440`** (chr5, `−`) — an off-target that **will** amplify (200 bp, 1 mismatch);
+  straddles the exon 11 / intron 11 boundary (78 bp exonic).
+- **`Zm00116aa067930`** (chr1) and **`Zm00116aa077600`** (chr10) — overlapped only by the gapped
+  1.5 kb / 1.2 kb pseudo-amplicons; not expected to amplify.
+
+The remaining amplicons and both guide off-targets are intergenic. The LH244 TE track
+(`*.fa.TE.gff3`) was checked and is uninformative — it contains only unnamed `similarity` features.
+
+## 3. Annotation maps
+
+```{r gene-model}
+TG <- "Zm00116aa310960"
+gff_cols <- c("seqid","src","type","start","end","score","strand","phase","attr")
+gm <- read_tsv(I(sh(sprintf("awk -F'\\t' '$9 ~ /%s/' %s", TG, shQuote(GFF)))),
+               col_names = gff_cols, show_col_types = FALSE)
+tg <- gm %>% filter(type == "gene"); tg_ex <- gm %>% filter(type == "exon") %>% arrange(start) %>% mutate(n = row_number())
+tg_amp <- amp_ov %>% filter(gene == TG); tg_gd <- gd_ov %>% filter(gene == TG)
+PAD <- 400L; WS <- tg$start - PAD; WE <- tg$end + PAD
+loc <- function(g) as.integer(g - WS + 1L)
+
+seqs    <- tibble(seq_id = "locus", length = WE - WS + 1L)
+exon_df <- tg_ex %>% transmute(seq_id = "locus", start = loc(start), end = loc(end), feat_type = "Exon", name = paste0("e", n))
+cds_df  <- gm %>% filter(type == "CDS") %>% transmute(seq_id = "locus", start = loc(start), end = loc(end), feat_type = "CDS")
+prim_df <- tibble(seq_id = "locus",
+                  start = c(loc(tg_amp$F_start), loc(tg_amp$R_end)),
+                  end   = c(loc(tg_amp$F_end),   loc(tg_amp$R_start)),   # drawn 5'->3'
+                  feat_type = c("forward_primer","reverse_primer"), name = c("mgd-F","mgd-R"))
+amp_df  <- tibble(seq_id = "locus", start = loc(tg_amp$from), end = loc(tg_amp$to),
+                  feat_type = "amplicon", name = sprintf("amplicon %d bp (0 mm)", tg_amp$amp_bp))
+gd_df   <- tibble(seq_id = "locus", start = loc(tg_gd$start), end = loc(tg_gd$end),
+                  feat_type = "guide", name = sprintf("sgRNA (PAM %s)", tg_gd$PAM))
+
+PAL_C <- c("Exon" = "#DAA520", "CDS" = "#8B6914", "amplicon" = "#2E8B57", "guide" = "#7B2D8B")
+LAB_C <- c("Exon" = "Exon", "CDS" = "CDS", "amplicon" = "Amplicon (264 bp, 0 mm)", "guide" = "sgRNA target")
+PAL_F <- c("forward_primer" = "#1F6FB4", "reverse_primer" = "#B4451F")
+LAB_F <- c("forward_primer" = "mgd-F", "reverse_primer" = "mgd-R")
+```
+
+### 3.1 Target locus — gene structure vs. amplicon and guide
+
+```{r map-target, fig.width=12, fig.height=4.6}
+p1 <- gggenomes(seqs = seqs, genes = prim_df,
+                feats = list(amplicon = amp_df, exons = exon_df, cds = cds_df, guide = gd_df)) +
+  geom_seq() +
+  geom_feat(data = feats(exons), aes(y = y-0.16, yend = y-0.16, color = feat_type),
+            position = "identity", linewidth = 5, alpha = 0.85) +
+  geom_feat(data = feats(cds), aes(y = y-0.16, yend = y-0.16, color = feat_type),
+            position = "identity", linewidth = 2.2) +
+  geom_text(data = exon_df, aes(x = (start+end)/2, y = 1-0.28, label = name),
+            size = 2.2, color = "grey25", inherit.aes = FALSE) +
+  geom_feat(data = feats(amplicon), aes(y = y+0.17, yend = y+0.17, color = feat_type),
+            position = "identity", linewidth = 3.2) +
+  geom_feat(data = feats(guide), aes(y = y+0.30, yend = y+0.30, color = feat_type),
+            position = "identity", linewidth = 5) +
+  geom_text(data = amp_df, aes(x = end + 70, y = 1.17, label = name), hjust = 0, size = 2.7,
+            color = "grey15", inherit.aes = FALSE) +
+  geom_text(data = gd_df, aes(x = (start + end)/2, y = 1.38, label = name), hjust = 0.5, size = 2.7,
+            color = "#7B2D8B", inherit.aes = FALSE) +
+  geom_gene(aes(fill = feat_type), color = NA, size = 9) +
+  geom_gene_label(aes(label = name), size = 2.4, nudge_y = 0.06) +
+  geom_vline(xintercept = c(loc(tg$start), loc(tg$end)), linetype = "dashed", color = "grey45", linewidth = 0.4) +
+  scale_color_manual(name = NULL, values = PAL_C, labels = LAB_C) +
+  scale_fill_manual(name = NULL, values = PAL_F, labels = LAB_F) +
+  scale_x_continuous(labels = function(x) format(round(x + WS - 1), big.mark = ",")) +
+  coord_cartesian(ylim = c(0.62, 1.42)) +
+  labs(title = sprintf("%s (chr5, %s strand) — mgd target locus", TG, tg$strand),
+       subtitle = sprintf("Gene %s:%s-%s, %d exons (dashed = gene bounds). Amplicon and sgRNA both lie in exon 1.",
+                          tg$seqid, format(tg$start, big.mark = ","), format(tg$end, big.mark = ","), nrow(tg_ex)),
+       x = "chr5 position (bp)") +
+  theme(legend.position = "bottom", axis.text.y = element_blank(), axis.ticks.y = element_blank(),
+        axis.title.y = element_blank(), panel.grid.minor = element_blank())
+ggsave(file.path(RES, "map_target_locus.png"), p1, width = 12, height = 4.6, dpi = 150)
+p1
+```
+
+### 3.2 Exon 1 zoom — primers, amplicon and sgRNA
+
+```{r map-zoom, fig.width=12, fig.height=3.8}
+p2 <- p1 + coord_cartesian(xlim = c(loc(tg_amp$from) - 150, loc(tg_ex$end[1]) + 150), ylim = c(0.72, 1.42)) +
+  labs(title = sprintf("%s — exon 1 zoom", TG),
+       subtitle = sprintf("sgRNA %s at chr5:%s-%s (+), PAM %s, %d bp inside the amplicon.",
+                          GUIDE, format(tg_gd$start, big.mark = ","), format(tg_gd$end, big.mark = ","),
+                          tg_gd$PAM, tg_gd$start - tg_amp$from))
+ggsave(file.path(RES, "map_target_zoom.png"), p2, width = 12, height = 3.8, dpi = 150)
+p2
+```
+
+### 3.3 The six credible amplicons side by side
+
+Window = amplicon ± 150 bp, common scale. Minus-strand loci are flipped so `mgd-F` is always
+leftmost — every panel is in primer orientation, not genome orientation.
+
+```{r map-panel, fig.width=12, fig.height=7}
+PADP <- 150L
+pan <- amp_ov %>% filter(gaps == 0) %>% arrange(mism, amp_bp) %>%
+  mutate(win_start = from - PADP, win_end = to + PADP,
+         panel = sprintf("%s  [%d bp, %d mm]", locus, amp_bp, mism)) %>%
+  mutate(panel = factor(panel, levels = rev(panel)))
+tl <- function(g, i) if (pan$strand[i] == "+") as.integer(g - pan$win_start[i] + 1L) else as.integer(pan$win_end[i] - g + 1L)
+seg <- function(a, b, i) sort(c(tl(a, i), tl(b, i)))
+
+pseqs <- pan %>% transmute(seq_id = as.character(panel), length = win_end - win_start + 1L)
+pamp  <- bind_rows(lapply(seq_len(nrow(pan)), function(i) { a <- seg(pan$from[i], pan$to[i], i)
+  tibble(seq_id = as.character(pan$panel[i]), start = a[1], end = a[2],
+         feat_type = if (pan$mism[i] == 0) "amplicon" else "off_target",
+         name = sprintf("%d bp", pan$amp_bp[i])) }))
+pprim <- bind_rows(lapply(seq_len(nrow(pan)), function(i) {
+  f <- seg(pan$F_start[i], pan$F_end[i], i); r <- seg(pan$R_start[i], pan$R_end[i], i)
+  tibble(seq_id = as.character(pan$panel[i]), start = c(f[1], r[2]), end = c(f[2], r[1]),
+         feat_type = c("forward_primer","reverse_primer"),
+         name = sprintf(c("F %dmm","R %dmm"), c(pan$F_mm[i], pan$R_mm[i]))) }))
+pex <- bind_rows(lapply(seq_len(nrow(pan)), function(i) {
+  ex <- gm %>% filter(type == "exon", seqid == pan$chr[i], end >= pan$win_start[i], start <= pan$win_end[i])
+  ex2 <- read_tsv(I(sh(sprintf("awk -F'\\t' 'NF==9 && $3==\"exon\" && $1==\"%s\" && $5>=%d && $4<=%d' %s",
+                               pan$chr[i], pan$win_start[i], pan$win_end[i], shQuote(GFF)))),
+                  col_names = gff_cols, show_col_types = FALSE)
+  if (!nrow(ex2)) return(NULL)
+  bind_rows(lapply(seq_len(nrow(ex2)), function(k) { s <- seg(max(ex2$start[k], pan$win_start[i]),
+                                                             min(ex2$end[k], pan$win_end[i]), i)
+    tibble(seq_id = as.character(pan$panel[i]), start = s[1], end = s[2], feat_type = "Exon",
+           name = sub("_T001.*", "", sub(".*Parent=", "", ex2$attr[k]))) })) }))
+# gggenomes only registers tracks from a plain list(); a conditional c(list(), if(..) list()) does not.
+if (is.null(pex) || !nrow(pex)) pex <- tibble(seq_id = character(), start = integer(), end = integer(),
+                                              feat_type = character(), name = character())
+# Text layers need their own y, one row per bin, else every label collapses onto a single y.
+gg <- gggenomes(seqs = pseqs, genes = pprim, feats = list(amplicons = pamp, exons = pex))
+ymap <- pull_seqs(gg$data) %>% ungroup() %>% select(seq_id, y)
+
+p3 <- gg + geom_seq() + geom_bin_label(size = 2.8, expand_left = 0.42) +
+  geom_feat(data = feats(exons), aes(y = y-0.20, yend = y-0.20, color = feat_type),
+            position = "identity", linewidth = 4.5, alpha = 0.8) +
+  geom_text(data = pex %>% left_join(ymap, by = "seq_id"), aes(x = (start+end)/2, y = y-0.36, label = name),
+            size = 2.1, color = "grey30", inherit.aes = FALSE) +
+  geom_feat(data = feats(amplicons), aes(y = y+0.22, yend = y+0.22, color = feat_type),
+            position = "identity", linewidth = 3) +
+  geom_text(data = pamp %>% left_join(ymap, by = "seq_id"), aes(x = (start+end)/2, y = y+0.40, label = name),
+            size = 2.5, color = "grey15", inherit.aes = FALSE) +
+  geom_gene(aes(fill = feat_type), color = NA, size = 7) +
+  geom_gene_label(aes(label = name), size = 2.1, nudge_y = 0.07) +
+  scale_color_manual(name = NULL,
+    values = c("Exon" = "#DAA520", "amplicon" = "#2E8B57", "off_target" = "#C0392B"),
+    labels = c("Exon" = "Exon of overlapping gene", "amplicon" = "Intended target (0 mm)",
+               "off_target" = "Off-target (1-2 mm, will amplify)")) +
+  scale_fill_manual(name = NULL, values = PAL_F, labels = LAB_F) +
+  coord_cartesian(ylim = c(0.45, nrow(pan) + 0.6)) +
+  labs(title = "The 6 credible products: intended target (top) vs. the five ~200 bp repeat-family copies",
+       x = "position within window (bp)") +
+  theme(legend.position = "bottom", axis.text.y = element_blank(), axis.ticks.y = element_blank(),
+        axis.title.y = element_blank(), panel.grid.minor = element_blank())
+ggsave(file.path(RES, "map_credible_loci.png"), p3, width = 12, height = 7, dpi = 150)
+p3
+```
+
+## 4. New primers designed around the guide (Primer3)
+
+Constraints: product **150–500 bp**, primers **19–24 nt**, **Tm 58–62 °C**, **GC clamp**, and no
+primer within **50 bp of either side of the guide**. Search template = **500 bp upstream of the
+exon 1 start** through 450 bp past the guide (`chr5:224,994,736-224,995,807`, 1072 bp), so the last
+194 bp are intron 1. The 50 bp clearance is enforced with `SEQUENCE_EXCLUDED_REGION` (guide ± 50)
+and `SEQUENCE_TARGET` forces every product to span the cut site.
+
+```{r p3-design}
+E1S <- min(tg_ex$start); GS <- tg_gd$start; GE <- tg_gd$end
+WS2 <- E1S - 500L; WE2 <- GE + 450L
+tmpl <- grab(tg$seqid, WS2, WE2)
+gl   <- GS - WS2                                  # 0-based local guide start
+stopifnot(substr(tmpl, gl + 1, gl + 20) == GUIDE, E1S - WS2 == 500)
+writeLines(tmpl, file.path(WORK, "design_window.txt"))
+
+p3in <- file.path(WORK, "p3_guide.txt"); p3out <- file.path(WORK, "p3_guide_out.txt")
+writeLines(c("SEQUENCE_ID=mgd_guide", paste0("SEQUENCE_TEMPLATE=", tmpl),
+  sprintf("SEQUENCE_TARGET=%d,20", gl), sprintf("SEQUENCE_EXCLUDED_REGION=%d,120", gl - 50L),
+  "PRIMER_TASK=generic","PRIMER_FIRST_BASE_INDEX=0",
+  "PRIMER_PICK_LEFT_PRIMER=1","PRIMER_PICK_RIGHT_PRIMER=1","PRIMER_PICK_INTERNAL_OLIGO=0",
+  "PRIMER_PRODUCT_SIZE_RANGE=150-500",
+  "PRIMER_MIN_SIZE=19","PRIMER_OPT_SIZE=21","PRIMER_MAX_SIZE=24",
+  "PRIMER_MIN_TM=58.0","PRIMER_OPT_TM=60.0","PRIMER_MAX_TM=62.0","PRIMER_PAIR_MAX_DIFF_TM=2.0",
+  "PRIMER_MIN_GC=40.0","PRIMER_OPT_GC_PERCENT=50.0","PRIMER_MAX_GC=60.0",
+  "PRIMER_GC_CLAMP=1","PRIMER_MAX_POLY_X=4","PRIMER_MAX_NS_ACCEPTED=0",
+  "PRIMER_THERMODYNAMIC_OLIGO_ALIGNMENT=0","PRIMER_THERMODYNAMIC_TEMPLATE_ALIGNMENT=0",
+  "PRIMER_EXPLAIN_FLAG=1","PRIMER_NUM_RETURN=20","="), p3in)
+sh(sprintf("primer3_core %s > %s", shQuote(p3in), shQuote(p3out)))
+
+L <- readLines(p3out); L <- L[grepl("=", L, fixed = TRUE) & L != "="]
+kv <- strsplit(L, "=", fixed = TRUE)
+d  <- setNames(vapply(kv, function(x) paste(x[-1], collapse = "="), ""), vapply(kv, `[`, "", 1))
+np <- as.integer(d[["PRIMER_PAIR_NUM_RETURNED"]])
+pairs <- bind_rows(lapply(0:(np-1), function(i) {
+  lp <- as.integer(strsplit(d[[sprintf("PRIMER_LEFT_%d", i)]], ",")[[1]])
+  rp <- as.integer(strsplit(d[[sprintf("PRIMER_RIGHT_%d", i)]], ",")[[1]])
+  f5 <- WS2 + lp[1]; r5 <- WS2 + rp[1]
+  tibble(rank = i, penalty = round(as.numeric(d[[sprintf("PRIMER_PAIR_%d_PENALTY", i)]]), 3),
+    prod = as.integer(d[[sprintf("PRIMER_PAIR_%d_PRODUCT_SIZE", i)]]),
+    F_seq = d[[sprintf("PRIMER_LEFT_%d_SEQUENCE", i)]], R_seq = d[[sprintf("PRIMER_RIGHT_%d_SEQUENCE", i)]],
+    F_len = lp[2], R_len = rp[2],
+    F_tm = round(as.numeric(d[[sprintf("PRIMER_LEFT_%d_TM", i)]]), 2),
+    R_tm = round(as.numeric(d[[sprintf("PRIMER_RIGHT_%d_TM", i)]]), 2),
+    F_gc = round(as.numeric(d[[sprintf("PRIMER_LEFT_%d_GC_PERCENT", i)]]), 1),
+    R_gc = round(as.numeric(d[[sprintf("PRIMER_RIGHT_%d_GC_PERCENT", i)]]), 1),
+    F_start = f5, F_end = f5 + lp[2] - 1L, R_end = r5 - rp[2] + 1L, R_start = r5,
+    gap5 = GS - (f5 + lp[2] - 1L) - 1L, gap3 = (r5 - rp[2] + 1L) - GE - 1L)
+}))
+# Re-check every constraint independently of Primer3's own filtering.
+chk <- pairs %>% transmute(rank,
+  len = F_len >= 19 & F_len <= 24 & R_len >= 19 & R_len <= 24,
+  tm  = F_tm >= 58 & F_tm <= 62 & R_tm >= 58 & R_tm <= 62,
+  prod_ok = prod >= 150 & prod <= 500,
+  clearance = gap5 >= 50 & gap3 >= 50,
+  clamp = grepl("[GC]$", F_seq) & grepl("[GC]$", R_seq))
+cat(sprintf("Primer3 returned %d pairs; all constraints independently satisfied: %s\n",
+            np, all(as.matrix(chk[,-1]))))
+```
+
+A pair can be specific while one of its primers is repetitive — which matters here, because the
+original reverse primer sat on a repeat motif (§1). So each candidate oligo is first counted
+genome-wide, and only pairs whose **both** primers are single-copy are eligible.
+
+```{r p3-copies}
+oligos <- unique(c(pairs$F_seq, pairs$R_seq))
+ofa <- file.path(WORK, "cand_oligos.fa"); writeLines(paste0(">o", seq_along(oligos), "\n", oligos), ofa)
+bl <- read_tsv(I(sh(sprintf(
+  "blastn -task blastn-short -query %s -db %s -evalue 1000 -max_target_seqs 100000 -num_threads 6 -outfmt %s",
+  shQuote(ofa), shQuote(DB), shQuote("6 qseqid length mismatch")))),
+  col_names = c("q","len","mm"), show_col_types = FALSE) %>%
+  mutate(oligo = oligos[as.integer(sub("^o", "", q))])
+cnt <- bl %>% filter(len == nchar(oligo), mm == 0) %>% count(oligo, name = "perfect_sites")
+knitr::kable(cnt %>% arrange(desc(perfect_sites)),
+             caption = "Perfect full-length genomic sites per candidate oligo. The two 3-copy oligos are repeat-motif derived and are rejected.")
+
+elig <- pairs %>%
+  left_join(cnt %>% dplyr::rename(F_seq = oligo, F_sites = perfect_sites), by = "F_seq") %>%
+  left_join(cnt %>% dplyr::rename(R_seq = oligo, R_sites = perfect_sites), by = "R_seq") %>%
+  mutate(across(c(F_sites, R_sites), ~replace_na(., 0L))) %>%
+  filter(F_sites == 1, R_sites == 1) %>% arrange(penalty)
+best <- elig[0, ]                                     # greedy: lowest penalty, distinct reverse primer
+for (i in seq_len(nrow(elig))) if (!(elig$R_seq[i] %in% best$R_seq)) {
+  best <- bind_rows(best, elig[i, ]); if (nrow(best) == 3) break }
+best <- best %>% mutate(name = paste0("mgdG-", row_number()))
+cat(sprintf("%d/%d pairs have both primers single-copy.\n", nrow(elig), nrow(pairs)))
+write_tsv(best, file.path(RES, "new_primers.tsv"))
+```
+
+```{r p3-table}
+knitr::kable(best %>% transmute(name, `product bp` = prod, penalty,
+  forward = F_seq, F_len, F_Tm = F_tm, `F_GC%` = F_gc,
+  reverse = R_seq, R_len, R_Tm = R_tm, `R_GC%` = R_gc,
+  `bp 5' of guide` = gap5, `bp 3' of guide` = gap3),
+  caption = "The best 3 pairs. Five unique oligos total (mgdG-1 and mgdG-2 share the forward primer).")
+```
+
+### Specificity of the new pairs — e-PCR
+
+```{r p3-epcr}
+sts2 <- file.path(WORK, "epcr_final.sts")
+writeLines(sprintf("%s\t%s\t%s\t150-600", best$name, best$F_seq, best$R_seq), sts2)
+out2 <- file.path(RES, "epcr_final.txt")
+sh(sprintf("e-PCR -n 3 -g 1 -m 50 -w 7 -t 3 -a f -o %s %s %s", shQuote(out2), shQuote(sts2), shQuote(GENOFA)))
+ep2 <- read_tsv(out2, comment = "#", show_col_types = FALSE,
+                col_names = c("seq","sts","strand","from","to","size","mism","gaps","x"))
+knitr::kable(ep2 %>% transmute(pair = sts, chr = seq, strand, from, to = to + 1L,
+                               size_bp = as.integer(str_replace(size, "/.*", "")) + 1L,
+                               mismatches = mism, gaps),
+  caption = sprintf("Genome-wide e-PCR (3 mismatches + 1 gap per primer): %s.",
+    ifelse(all(table(ep2$sts) == 1) && all(ep2$mism == 0),
+           "every pair gives exactly ONE product, at the target, with 0 mismatches",
+           "CHECK — more than one product")))
+```
+
+All three pairs are **single-product, zero-mismatch** genome-wide — a clean result compared with
+the original pair's six products (§1).
+
+```{r map-new, fig.width=12, fig.height=4.6}
+nb <- best %>% mutate(y_off = 0.17 + 0.13 * (row_number() - 1))
+nseq <- tibble(seq_id = "locus", length = WE2 - WS2 + 1L)
+l2 <- function(g) as.integer(g - WS2 + 1L)
+nex <- gm %>% filter(type == "exon", end >= WS2, start <= WE2) %>%
+  transmute(seq_id = "locus", start = l2(pmax(start, WS2)), end = l2(pmin(end, WE2)), feat_type = "Exon")
+ngd <- tibble(seq_id = "locus", start = l2(GS), end = l2(GE), feat_type = "guide")
+namp <- nb %>% transmute(seq_id = "locus", start = l2(F_start), end = l2(R_start),
+                         feat_type = "new_amplicon", name = sprintf("%s  %d bp", name, prod), y_off)
+nprim <- bind_rows(lapply(seq_len(nrow(nb)), function(i) tibble(seq_id = "locus",
+  start = c(l2(nb$F_start[i]), l2(nb$R_start[i])), end = c(l2(nb$F_end[i]), l2(nb$R_end[i])),
+  feat_type = c("forward_primer","reverse_primer"))))
+
+p4 <- gggenomes(seqs = nseq, genes = nprim, feats = list(amps = namp, exons = nex, guide = ngd)) +
+  geom_seq() +
+  geom_feat(data = feats(exons), aes(y = y-0.14, yend = y-0.14, color = feat_type),
+            position = "identity", linewidth = 5, alpha = 0.85) +
+  geom_feat(data = feats(guide), aes(y = y+0.05, yend = y+0.05, color = feat_type),
+            position = "identity", linewidth = 6) +
+  geom_feat(data = feats(amps), aes(y = y+y_off, yend = y+y_off, color = feat_type),
+            position = "identity", linewidth = 2.8) +
+  geom_text(data = namp, aes(x = end + 12, y = 1 + y_off, label = name), hjust = 0,
+            size = 2.6, color = "grey15", inherit.aes = FALSE) +
+  geom_gene(aes(fill = feat_type), color = NA, size = 6) +
+  geom_vline(xintercept = c(l2(GS - 50), l2(GE + 50)), linetype = "dotted", color = "#7B2D8B", linewidth = 0.4) +
+  geom_vline(xintercept = l2(E1S), linetype = "dashed", color = "grey45", linewidth = 0.4) +
+  scale_color_manual(name = NULL,
+    values = c("Exon" = "#DAA520", "guide" = "#7B2D8B", "new_amplicon" = "#2E8B57"),
+    labels = c("Exon" = "Exon", "guide" = "sgRNA target", "new_amplicon" = "New amplicon")) +
+  scale_fill_manual(name = NULL, values = PAL_F, labels = c("forward_primer" = "forward", "reverse_primer" = "reverse")) +
+  scale_x_continuous(labels = function(x) format(round(x + WS2 - 1), big.mark = ",")) +
+  coord_cartesian(ylim = c(0.7, 1.62)) +
+  labs(title = "New primer pairs around the sgRNA cut site",
+       subtitle = "Dotted purple = 50 bp exclusion either side of the guide; dashed grey = exon 1 start. All 3 products span the cut site.",
+       x = "chr5 position (bp)") +
+  theme(legend.position = "bottom", axis.text.y = element_blank(), axis.ticks.y = element_blank(),
+        axis.title.y = element_blank(), panel.grid.minor = element_blank())
+ggsave(file.path(RES, "map_new_primers.png"), p4, width = 12, height = 4.6, dpi = 150)
+p4
+```
+
+## Bottom line
+
+| Band | Source | Allele-informative? |
+|---|---|---|
+| **264 bp** | `Zm00116aa310960` exon 1 — intended *mgd* target, 0 mismatches; contains the sgRNA site | **yes** |
+| **~200 bp** | ≥5 repeat-family loci (chr5 ×2, chr6 ×2, chr8), 1–2 mismatches, 3′ ends intact | no |
+
+The two bands are 64 bp apart and resolvable on a 2 % gel, but the ~200 bp band competes for
+primer and polymerase and cannot be used for dosage or presence/absence calls. **Moving the
+reverse primer into intron 1** (`chr5:224,995,614-224,995,733`) breaks the 200 bp repeat
+architecture and makes the product intron-spanning; re-running this document is the check.
+
+The **sgRNA itself is well placed**: unique as a perfect match, inside exon 1 of the target, with
+its only two near-matches (1 mismatch at position 19, PAM-proximal) in intergenic space.
+
+*Caveats.* e-PCR and BLAST are string-matching scans, not thermodynamic or cleavage models — a
+3′-intact ≤2-mismatch primer site is *expected* to amplify and a 19/20 + NGG site is a *candidate*
+cut site; both need empirical confirmation. `Zm00116aa310960` is identified as an MGDG synthase
+from its protein sequence, not from the GFF3, which carries no functional annotation.
+
+## References
+
+- LH244 reference and annotation: **Zm-LH244-REFERENCE-CAU-1.0**, `Zm00116aa.1`, MaizeGDB.
+  <https://download.maizegdb.org/Zm-LH244-REFERENCE-CAU-1.0/>
+- **e-PCR**: Schuler GD (1997) Sequence mapping by electronic PCR. *Genome Res* 7:541-550.
+- **BLAST+**: Camacho C *et al.* (2009) *BMC Bioinformatics* 10:421. (`blastn-short` for queries < 50 nt.)
+- **bedtools**: Quinlan AR & Hall IM (2010) *Bioinformatics* 26:841-842.
+- **gggenomes**: Hackl T *et al.* — <https://thackl.github.io/gggenomes/>
+
+```{r sessioninfo}
+#| code-fold: true
+sessionInfo()
+```

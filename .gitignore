@@ -11,6 +11,13 @@ work/*
 !work/locus.fa
 !work/gene.gff3
 
+# --- LH244 (mgd) intermediates and outputs: NOT tracked ---
+# work_lh244/ is ~1.1 GB (decompressed GFF3s, TE track, BLAST DBs, interval BEDs) and holds
+# files above GitHub's 100 MB limit; results_lh244/ is regenerated outputs. Both are rebuilt
+# from scratch by mgd_LH244_primer_check.qmd, so only the .qmd and docs/ need tracking.
+work_lh244/
+results_lh244/
+
 # --- Quarto / knitr / R render artifacts ---
 /.quarto/
 *_files/

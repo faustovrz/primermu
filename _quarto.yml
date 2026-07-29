@@ -3,3 +3,4 @@ project:
   output-dir: docs
   render:
     - mu1046085_primer_design.qmd
+    - mgd_LH244_primer_check.qmd
