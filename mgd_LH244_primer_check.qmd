@@ -357,36 +357,6 @@ five off-target windows are homologous to each other across their **entire** 500
 ~200 bp product is a small window onto a much larger shared element; the target shares only two
 blocks with them, one containing each primer site.
 
-::: {.callout-note collapse="true"}
-## Why the 40 bp floor, and why `-evalue 1e-5` is not the strict part here
-
-The `MIN_HOM = 40` filter currently discards **nothing**. The all-vs-all returns 40 HSPs and the
-shortest is 111 bp — the distribution is bimodal, either 111-178 bp (target vs. family) or the full
-500 bp (family vs. family) — and a merged block is at least as long as its longest HSP. It is a
-guard against widening `PADP`, not a filter doing work.
-
-The length floor is the strict criterion because the E-value is not. E-values carry the search
-space,
-
-$$E = K\,m\,n\,e^{-\lambda S} = m\,n\,2^{-B}, \qquad B = \frac{\lambda S - \ln K}{\ln 2}$$
-
-so the same alignment always scores the same bit score $B$, while its E-value scales with the
-database. Six windows totalling 3,064 bp give an effective space of ~10⁴-10⁶, against which `1e-5`
-sets a bar of only ~32 bits — roughly a **17 bp exact match**. Measured against these windows
-(BLAST reports gapped $\lambda = 0.625$, $K = 0.410$ for reward +2 / penalty −3):
-
-| perfect match | raw | bits | E |
-|---|---|---|---|
-| 20 bp | 40 | 37.4 | 1.7 × 10⁻⁷ |
-| 40 bp | 80 | 73.4 | 6.9 × 10⁻¹⁸ |
-| 111 bp | 222 | 201 | 6.7 × 10⁻⁵⁶ |
-
-A 20-mer clears `1e-5` here by two orders of magnitude; against the whole 2.3 Gb assembly the same
-20-mer would have E ≈ 0.1, i.e. expected by chance. That is the same arithmetic that forces
-`blastn-short` with `-evalue 10` for the 20 nt guide in §1 — identical alignment, search space six
-orders of magnitude larger, opposite verdict.
-:::
-
 ```{r map-panel, fig.width=12, fig.height=9}
 PADP <- 150L
 pan <- amp_ov %>% filter(gaps == 0) %>% arrange(mism, amp_bp) %>%
@@ -467,10 +437,7 @@ merge_iv <- function(d) {                      # merge overlapping/abutting HSPs
   bind_rows(lapply(out, function(z) tibble(start = z$s, end = z$e,
     n_copies = n_distinct(z$subj), pmax = max(z$p))))
 }
-# Guard, not a working filter: the shortest HSP here is 111 bp, so this discards nothing as written.
-# It matters only if PADP widens, because -evalue 1e-5 over a 3 kb subject set is a ~32-bit bar
-# (~17 bp exact) — the length floor, not the E-value, is what keeps short noise out. See the note above.
-MIN_HOM <- 40L
+MIN_HOM <- 40L   # guard only: shortest HSP here is 111 bp, so nothing is dropped unless PADP widens
 phom <- bind_rows(lapply(seq_len(nrow(pan)), function(i) {
   h <- hom %>% filter(q == pan$locus[i]); if (!nrow(h)) return(NULL)
   m <- merge_iv(h) %>% filter(end - start + 1L >= MIN_HOM); if (!nrow(m)) return(NULL)
